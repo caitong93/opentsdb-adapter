@@ -1,3 +1,15 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package opentsdb
 
 import (
@@ -11,8 +23,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-kit/kit/log/level"
 
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/common/model"
@@ -75,9 +91,6 @@ func tagsFromMetric(m model.Metric) map[string]TagValue {
 	for l, v := range m {
 		if l == model.MetricNameLabel {
 			continue
-		}
-		if v == "" {
-			v = defaultEmptyTagValue
 		}
 		tags[string(l)] = TagValue(v)
 	}
@@ -179,31 +192,34 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 				errCh <- err
 				return
 			}
+			fmt.Println(string(rawBytes))
 
 			resp, err := ctxhttp.Post(ctx, c.client, c.url+queryEndpoint, contentTypeJSON, bytes.NewBuffer(rawBytes))
 			if err != nil {
+				level.Warn(c.logger).Log("falied to send request to opentsdb")
 				errCh <- err
 				return
 			}
-			if resp.StatusCode != 200 {
-				errCh <- fmt.Errorf("got status code %v", resp.StatusCode)
-				return
-			}
-			var res otdbQueryRes
+			defer resp.Body.Close()
 			rawBytes, err = ioutil.ReadAll(resp.Body)
 			if err != nil {
 				errCh <- err
 				return
 			}
+			if resp.StatusCode != 200 {
+				level.Warn(c.logger).Log(fmt.Sprintf("query opentsdb error: %s", string(rawBytes)))
+				errCh <- fmt.Errorf("got status code %v", resp.StatusCode)
+				return
+			}
+			var res otdbQueryResSet
+
 			if err = json.Unmarshal(rawBytes, &res); err != nil {
 				errCh <- err
 				return
 			}
 			l.Lock()
-			defer l.Unlock()
-			if err = mergeResult(labelsToSeries, &res); err != nil {
-				errCh <- err
-			}
+			err = mergeResult(labelsToSeries, &res)
+			l.Unlock()
 			errCh <- nil
 		}(queryReqs[i])
 	}
@@ -237,97 +253,133 @@ loop:
 	return &resp, nil
 }
 
-func mergeResult(labelsToSeries map[string]*prompb.TimeSeries, results *otdbQueryRes) error {
+func concatLabels(labels map[string]TagValue) string {
+	// 0xff cannot cannot occur in valid UTF-8 sequences, so use it
+	// as a separator here.
+	separator := "\xff"
+	pairs := make([]string, 0, len(labels))
+	for k, v := range labels {
+		pairs = append(pairs, k+separator+string(v))
+	}
+	return strings.Join(pairs, separator)
+}
+
+func tagsToLabelPairs(name string, tags map[string]TagValue) []*prompb.Label {
+	pairs := make([]*prompb.Label, 0, len(tags))
+	for k, v := range tags {
+		pairs = append(pairs, &prompb.Label{
+			Name:  k,
+			Value: string(v),
+		})
+	}
+	pairs = append(pairs, &prompb.Label{
+		Name:  model.MetricNameLabel,
+		Value: name,
+	})
+	return pairs
+}
+
+func mergeResult(labelsToSeries map[string]*prompb.TimeSeries, results *otdbQueryResSet) error {
+	for _, r := range *results {
+		k := concatLabels(r.Tags)
+		ts, ok := labelsToSeries[k]
+		if !ok {
+			ts = &prompb.TimeSeries{
+				Labels: tagsToLabelPairs(string(r.Metric), r.Tags),
+			}
+			labelsToSeries[k] = ts
+		}
+		ts.Samples = mergeSamples(ts.Samples, valuesToSamples(r.DPs))
+	}
 	return nil
+}
+
+func valuesToSamples(dps otdbDPs) []*prompb.Sample {
+	samples := make([]*prompb.Sample, 0, len(dps))
+	for t, v := range dps {
+		samples = append(samples, &prompb.Sample{
+			Timestamp: t * 1000,
+			Value:     v,
+		})
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		if samples[i].Timestamp != samples[j].Timestamp {
+			return samples[i].Timestamp < samples[j].Timestamp
+		}
+		return samples[i].Value < samples[j].Value
+	})
+	return samples
+}
+
+// mergeSamples merges two lists of sample pairs and removes duplicate
+// timestamps. It assumes that both lists are sorted by timestamp.
+func mergeSamples(a, b []*prompb.Sample) []*prompb.Sample {
+	result := make([]*prompb.Sample, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].Timestamp < b[j].Timestamp {
+			result = append(result, a[i])
+			i++
+		} else if a[i].Timestamp > b[j].Timestamp {
+			result = append(result, b[j])
+			j++
+		} else {
+			result = append(result, a[i])
+			i++
+			j++
+		}
+	}
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+	return result
 }
 
 func (c *Client) buildQueryReq(q *prompb.Query) (*otdbQueryReq, error) {
 	req := otdbQueryReq{
-		Start: q.GetStartTimestampMs() / 1000
-		End: q.GetEndTimestampMs() / 1000,
+		Start: q.GetStartTimestampMs() / 1000,
+		End:   q.GetEndTimestampMs() / 1000,
 	}
 
-	qr := &otdbQuery{
+	qr := otdbQuery{
 		Aggregator: "none",
 	}
 	for _, m := range q.Matchers {
 		if m.Name == model.MetricNameLabel {
 			switch m.Type {
 			case prompb.LabelMatcher_EQ:
-				qr.Metric = m.Value
+				qr.Metric = TagValue(m.Value)
 			default:
 				// TODO: Figure out how to support these efficiently.
 				return nil, fmt.Errorf("regex, non-equal or regex-non-equal matchers are not supported on the metric name yet")
 			}
 			continue
 		}
-		ft := &otdbFilter{
+		ft := otdbFilter{
 			GroupBy: true,
-			Tagk: m.Name,
+			Tagk:    m.Name,
 		}
 		switch m.Type {
 		case prompb.LabelMatcher_EQ:
-			matchers = append(matchers, fmt.Sprintf("%q = '%s'", m.Name, escapeSingleQuotes(m.Value)))
+			ft.Type = otdbFilterTypeLiteralOr
+			ft.Filter = toTagValue(m.Value)
 		case prompb.LabelMatcher_NEQ:
-			matchers = append(matchers, fmt.Sprintf("%q != '%s'", m.Name, escapeSingleQuotes(m.Value)))
+			ft.Type = otdbFilterTypeNotLiteralOr
+			ft.Filter = toTagValue(m.Value)
 		case prompb.LabelMatcher_RE:
-			matchers = append(matchers, fmt.Sprintf("%q =~ /^%s$/", m.Name, escapeSlashes(m.Value)))
+			return nil, fmt.Errorf("unsupported match type RE")
 		case prompb.LabelMatcher_NRE:
-			matchers = append(matchers, fmt.Sprintf("%q !~ /^%s$/", m.Name, escapeSlashes(m.Value)))
+			return nil, fmt.Errorf("unsupported match type NRE")
 		default:
-			return "", fmt.Errorf("unknown match type %v", m.Type)
+			return nil, fmt.Errorf("unknown match type %v", m.Type)
 		}
+		qr.Filters = append(qr.Filters, ft)
 	}
 
-	return nil, nil
-}
-
-func escapeSlashes(str string) string {
-	return strings.Replace(str, `/`, `\/`, -1)
+	req.Queries = append(req.Queries, qr)
+	return &req, nil
 }
 
 // Name identifies the client as an OpenTSDB client.
 func (c *Client) Name() string {
 	return "opentsdb"
-}
-
-type otdbQueryResSet []otdbQueryRes
-
-type otdbQueryRes struct {
-	Metric TagValue `json:"metric"`
-	// A list of tags only returned when the results are for a single time series.
-	// If results are aggregated, this value may be null or an empty map
-	Tags map[string]TagValue `json:"tags"`
-	// If more than one timeseries were included in the result set, i.e. they were
-	// aggregated, this will display a list of tag names that were found in common across all time series.
-	AggregatedTags map[string]TagValue `json:"aggregatedTags"`
-	DPs            otdbDPs           `json:"dps"`
-}
-
-type otdbDPs map[int64]float64
-
-type otdbQueryReq struct {
-	Start   int64       `json:"start"`
-	End     int64       `json:"end"`
-	Queries []otdbQuery `json:"queries"`
-}
-
-type otdbQuery struct {
-	Metric     string       `json:"metric"`
-	Filters    []otdbFilter `json:"filters"`
-	Aggregator string       `json:"aggregator"`
-}
-
-type otdbFilterType string
-
-const (
-	otdbFilterTypeLiteralOr    = "literal_or"
-	otdbFilterTypeNotLiteralOr = "not_literal_or"
-)
-
-type otdbFilter struct {
-	Type    otdbFilterType `json:"type"`
-	Tagk    string         `json:"tagk"`
-	Filter  string         `json:"filter"`
-	GroupBy bool         `json:"groupBy"`
 }

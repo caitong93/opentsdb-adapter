@@ -7,6 +7,6 @@ RUN echo "http://mirrors.aliyun.com/alpine/v3.6/community" >> /etc/apk/repositor
 RUN apk update && apk add -t .base curl bash tzdata ca-certificates \
   && cp -r -f /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
-COPY adapter /adapter
-ENTRYPOINT ["/adapter"]
+COPY opentsdb-adapter /opentsdb-adapter
+ENTRYPOINT ["/opentsdb-adapter"]
 

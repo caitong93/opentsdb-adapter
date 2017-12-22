@@ -162,3 +162,27 @@ func (tv *TagValue) UnmarshalJSON(json []byte) error {
 	*tv = TagValue(result.String())
 	return nil
 }
+
+func toTagValue(tv string) string {
+	length := len(tv)
+	if length == 0 {
+		return defaultEmptyTagValue
+	}
+	result := bytes.NewBuffer(make([]byte, 0, length))
+	for i := 0; i < length; i++ {
+		b := tv[i]
+		switch {
+		case (b >= '-' && b <= '9') || // '-', '.', '/', 0-9
+			(b >= 'A' && b <= 'Z') ||
+			(b >= 'a' && b <= 'z'):
+			result.WriteByte(b)
+		case b == '_':
+			result.WriteString("__")
+		case b == ':':
+			result.WriteString("_.")
+		default:
+			result.WriteString(fmt.Sprintf("_%X", b))
+		}
+	}
+	return result.String()
+}

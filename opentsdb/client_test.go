@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/prompb"
 )
 
 var (
@@ -71,5 +72,63 @@ func TestMarshalStoreSamplesRequest(t *testing.T) {
 			"Unmarshal(expectedJSON, &unmarshaledRequest) => %#v, want %#v",
 			unmarshaledRequest, request,
 		)
+	}
+}
+
+func TestBuildQueryReq(t *testing.T) {
+	query := prompb.Query{
+		StartTimestampMs: 1513834123 * 1000,
+		EndTimestampMs:   (1513834123 + 1000) * 1000,
+		Matchers: []*prompb.LabelMatcher{
+			{
+				Type:  prompb.LabelMatcher_EQ,
+				Name:  model.MetricNameLabel,
+				Value: "container_cpu_usage_seconds_total",
+			},
+			{
+				Type:  prompb.LabelMatcher_EQ,
+				Name:  "namespace",
+				Value: "ns_1",
+			},
+			{
+				Type:  prompb.LabelMatcher_NEQ,
+				Name:  "pod_name",
+				Value: "POD",
+			},
+		},
+	}
+
+	expected := otdbQueryReq{
+		Start: 1513834123,
+		End:   1513834123 + 1000,
+		Queries: []otdbQuery{
+			{
+				Metric:     TagValue("container_cpu_usage_seconds_total"),
+				Aggregator: "none",
+				Filters: []otdbFilter{
+					{
+						Type:    otdbFilterTypeLiteralOr,
+						Tagk:    "namespace",
+						Filter:  "ns__1",
+						GroupBy: true,
+					},
+					{
+						Type:    otdbFilterTypeNotLiteralOr,
+						Tagk:    "pod_name",
+						Filter:  "POD",
+						GroupBy: true,
+					},
+				},
+			},
+		},
+	}
+
+	c := &Client{}
+	resp, err := c.buildQueryReq(&query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(expected, *resp) {
+		t.Errorf("expect %#v, got %#v", expected, *resp)
 	}
 }

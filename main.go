@@ -1,3 +1,16 @@
+// Copyright 2017 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -117,6 +130,7 @@ func buildClients(logger log.Logger, cfg *config) ([]writer, []reader) {
 			cfg.remoteTimeout,
 		)
 		writers = append(writers, c)
+		readers = append(readers, c)
 	}
 	level.Info(logger).Log("Starting up...")
 	return writers, readers
@@ -160,13 +174,13 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 	})
 
 	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
+		level.Info(logger).Log("msg", "Start to handle read request")
 		compressed, err := ioutil.ReadAll(r.Body)
 		if err != nil {
-			level.Error(logger).Log("msg", "Read error", "err", err.Error())
+			level.Error(logger).Log("msg", "Read body error", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
 		reqBuf, err := snappy.Decode(nil, compressed)
 		if err != nil {
 			level.Error(logger).Log("msg", "Decode error", "err", err.Error())
@@ -180,7 +194,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-
+		fmt.Printf("__DEBUG__ decode body done\n")
 		// TODO: Support reading from more than one reader and merging the results.
 		if len(readers) != 1 {
 			http.Error(w, fmt.Sprintf("expected exactly one reader, found %d readers", len(readers)), http.StatusInternalServerError)
@@ -188,6 +202,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 		}
 		reader := readers[0]
 
+		fmt.Printf("__DEBUG__ start to read\n")
 		var resp *prompb.ReadResponse
 		resp, err = reader.Read(&req)
 		if err != nil {
@@ -195,6 +210,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		fmt.Printf("__DEBUG__ client read done\n")
 
 		data, err := proto.Marshal(resp)
 		if err != nil {
@@ -212,6 +228,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 		}
 	})
 
+	fmt.Printf("Start listening serve on %s\n", addr)
 	return http.ListenAndServe(addr, nil)
 }
 
