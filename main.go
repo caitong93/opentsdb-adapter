@@ -194,7 +194,6 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		fmt.Printf("__DEBUG__ decode body done\n")
 		// TODO: Support reading from more than one reader and merging the results.
 		if len(readers) != 1 {
 			http.Error(w, fmt.Sprintf("expected exactly one reader, found %d readers", len(readers)), http.StatusInternalServerError)
@@ -202,7 +201,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 		}
 		reader := readers[0]
 
-		fmt.Printf("__DEBUG__ start to read\n")
+		level.Info(logger).Log("msg", "Start to read from remote")
 		var resp *prompb.ReadResponse
 		resp, err = reader.Read(&req)
 		if err != nil {
@@ -210,7 +209,7 @@ func serve(logger log.Logger, addr string, writers []writer, readers []reader) e
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		fmt.Printf("__DEBUG__ client read done\n")
+		level.Info(logger).Log("msg", "Client read done")
 
 		data, err := proto.Marshal(resp)
 		if err != nil {

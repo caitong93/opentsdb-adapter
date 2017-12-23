@@ -28,6 +28,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kr/pretty"
+
 	"github.com/go-kit/kit/log/level"
 
 	"github.com/go-kit/kit/log"
@@ -164,13 +166,16 @@ func (c *Client) Write(samples model.Samples) error {
 }
 
 func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
+	pretty.Println(req)
 	queryReqs := make([]*otdbQueryReq, 0, len(req.Queries))
+	smatchers := make(map[*otdbQueryReq]seriesMatcher)
 	for _, q := range req.Queries {
-		res, err := c.buildQueryReq(q)
+		res, matcher, err := c.buildQueryReq(q)
 		if err != nil {
 			return nil, err
 		}
 		queryReqs = append(queryReqs, res)
+		smatchers[res] = matcher
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
@@ -218,7 +223,7 @@ func (c *Client) Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error) {
 				return
 			}
 			l.Lock()
-			err = mergeResult(labelsToSeries, &res)
+			err = mergeResult(labelsToSeries, smatchers[queryReq], &res)
 			l.Unlock()
 			errCh <- nil
 		}(queryReqs[i])
@@ -279,8 +284,19 @@ func tagsToLabelPairs(name string, tags map[string]TagValue) []*prompb.Label {
 	return pairs
 }
 
-func mergeResult(labelsToSeries map[string]*prompb.TimeSeries, results *otdbQueryResSet) error {
-	for _, r := range *results {
+func mergeResult(labelsToSeries map[string]*prompb.TimeSeries, smatcher seriesMatcher, results *otdbQueryResSet) error {
+	var series otdbQueryResSet
+	if smatcher == nil {
+		series = *results
+	} else {
+		series = make([]*otdbQueryRes, 0, len(*results))
+		for _, r := range *results {
+			if smatcher.Match(r.Tags) {
+				series = append(series, r)
+			}
+		}
+	}
+	for _, r := range series {
 		k := concatLabels(r.Tags)
 		ts, ok := labelsToSeries[k]
 		if !ok {
@@ -334,7 +350,7 @@ func mergeSamples(a, b []*prompb.Sample) []*prompb.Sample {
 	return result
 }
 
-func (c *Client) buildQueryReq(q *prompb.Query) (*otdbQueryReq, error) {
+func (c *Client) buildQueryReq(q *prompb.Query) (*otdbQueryReq, seriesMatcher, error) {
 	req := otdbQueryReq{
 		Start: q.GetStartTimestampMs() / 1000,
 		End:   q.GetEndTimestampMs() / 1000,
@@ -343,6 +359,7 @@ func (c *Client) buildQueryReq(q *prompb.Query) (*otdbQueryReq, error) {
 	qr := otdbQuery{
 		Aggregator: "none",
 	}
+	var smatcher seriesMatcher
 	for _, m := range q.Matchers {
 		if m.Name == model.MetricNameLabel {
 			switch m.Type {
@@ -350,7 +367,7 @@ func (c *Client) buildQueryReq(q *prompb.Query) (*otdbQueryReq, error) {
 				qr.Metric = TagValue(m.Value)
 			default:
 				// TODO: Figure out how to support these efficiently.
-				return nil, fmt.Errorf("regex, non-equal or regex-non-equal matchers are not supported on the metric name yet")
+				return nil, nil, fmt.Errorf("regex, non-equal or regex-non-equal matchers are not supported on the metric name yet")
 			}
 			continue
 		}
@@ -366,17 +383,29 @@ func (c *Client) buildQueryReq(q *prompb.Query) (*otdbQueryReq, error) {
 			ft.Type = otdbFilterTypeNotLiteralOr
 			ft.Filter = toTagValue(m.Value)
 		case prompb.LabelMatcher_RE:
-			return nil, fmt.Errorf("unsupported match type RE")
+			ft.Type = otdbFilterTypeWildcard
+			ft.Filter = "*"
+			tmp, err := NewLabelMatcher(RegexMatch, m.Name, m.Value)
+			if err != nil {
+				return nil, nil, fmt.Errorf("create matcher error: %v", err)
+			}
+			smatcher = append(smatcher, tmp)
 		case prompb.LabelMatcher_NRE:
-			return nil, fmt.Errorf("unsupported match type NRE")
+			ft.Type = otdbFilterTypeWildcard
+			ft.Filter = "*"
+			tmp, err := NewLabelMatcher(RegexNoMatch, m.Name, m.Value)
+			if err != nil {
+				return nil, nil, fmt.Errorf("create matcher error: %v", err)
+			}
+			smatcher = append(smatcher, tmp)
 		default:
-			return nil, fmt.Errorf("unknown match type %v", m.Type)
+			return nil, nil, fmt.Errorf("unknown match type %v", m.Type)
 		}
 		qr.Filters = append(qr.Filters, ft)
 	}
 
 	req.Queries = append(req.Queries, qr)
-	return &req, nil
+	return &req, smatcher, nil
 }
 
 // Name identifies the client as an OpenTSDB client.

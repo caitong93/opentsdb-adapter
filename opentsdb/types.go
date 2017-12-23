@@ -32,6 +32,8 @@ type otdbFilterType string
 const (
 	otdbFilterTypeLiteralOr    = "literal_or"
 	otdbFilterTypeNotLiteralOr = "not_literal_or"
+	otdbFilterTypeRegexp       = "regexp"
+	otdbFilterTypeWildcard     = "wildcard"
 )
 
 type otdbFilter struct {
